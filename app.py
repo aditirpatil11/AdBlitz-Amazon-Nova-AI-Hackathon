@@ -1,15 +1,16 @@
 import streamlit as st
+import base64
+import json
 
-
-from components.upload       import render_upload
-from components.loading      import render_loading
-from components.brand_card   import render_brand_card
-from components.copy_tabs    import render_copy_tabs
+from components.upload        import render_upload
+from components.loading       import render_loading
+from components.brand_card    import render_brand_card
+from components.copy_tabs     import render_copy_tabs
 from components.image_gallery import render_image_gallery
-from components.video_player import render_video_player
+from components.video_player  import render_video_player
 from components.persona_cards import render_persona_cards
-from components.media_plan   import render_media_plan
-from components.refine_bar   import render_refine_bar
+from components.media_plan    import render_media_plan
+from components.refine_bar    import render_refine_bar
 
 # ── Page config ───────────────────────────────────────────────
 st.set_page_config(
@@ -19,7 +20,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# ── Global CSS polish ─────────────────────────────────────────
+# ── Global CSS ────────────────────────────────────────────────
 st.markdown("""
     <style>
     .stButton > button[kind="primary"] {
@@ -46,21 +47,29 @@ st.markdown("""
 st.divider()
 
 # ── Session state ─────────────────────────────────────────────
-if "campaign_data" not in st.session_state:
-    st.session_state.campaign_data = None
-if "is_loading" not in st.session_state:
-    st.session_state.is_loading = False
+for key, default in {
+    "campaign_data":   None,
+    "is_loading":      False,
+    "uploaded_file":   None,
+    "image_bytes":     None,
+    "refine_feedback": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
 # ── Callbacks ─────────────────────────────────────────────────
 def handle_generate(uploaded_file):
-    st.session_state.is_loading = True
+    st.session_state.uploaded_file = uploaded_file
+    st.session_state.image_bytes   = uploaded_file.getvalue()
+    st.session_state.is_loading    = True
     st.session_state.campaign_data = None
     st.rerun()
 
 
 def handle_refine(feedback):
-    st.session_state.is_loading = True
+    st.session_state.refine_feedback = feedback
+    st.session_state.is_loading      = True
     st.rerun()
 
 
@@ -73,41 +82,58 @@ st.divider()
 if st.session_state.is_loading:
     render_loading()
     try:
-        # ── Phase 12: swap this line for the real call ────────
-        # from agents.orchestrator import generate_campaign
-        # st.session_state.campaign_data = generate_campaign(uploaded_file)
-
         from agents.orchestrator import generate_campaign, refine_campaign
 
+        image_bytes = st.session_state.image_bytes
+
         if st.session_state.refine_feedback:
-            st.session_state.campaign_data = refine_campaign(
+            result = refine_campaign(
                 st.session_state.refine_feedback,
-                st.session_state.campaign_data
+                st.session_state.campaign_data,
+                image_bytes=image_bytes
             )
             st.session_state.refine_feedback = None
+
         else:
-            st.session_state.campaign_data = generate_campaign(
-                st.session_state.uploaded_file
-            )
+            result = generate_campaign(image_bytes)
+
+        # Safety net — if result is a string parse it
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except json.JSONDecodeError as je:
+                raise Exception(
+                    f"Agent returned invalid JSON: {je}\n\n"
+                    f"Raw output (first 500 chars):\n{result[:500]}"
+                )
+
+        st.session_state.campaign_data = result
 
     except Exception as e:
         st.error(f"⚠️ Campaign generation failed: {str(e)}")
-        st.info("Please try again or contact the team.")
+        with st.expander("🐛 Debug info — share this with Person 1"):
+            st.code(str(e))
+        st.info("Please try again.")
         st.session_state.campaign_data = None
+
     finally:
         st.session_state.is_loading = False
-        st.rerun()
+        # Only rerun if campaign generated successfully — this enables scrolling
+        if st.session_state.campaign_data is not None:
+            st.rerun()
 
 # ── Display campaign ──────────────────────────────────────────
 if st.session_state.campaign_data:
     data = st.session_state.campaign_data
 
-    # Metrics bar — judges love numbers
+    st.success("🎉 Your campaign is ready! Scroll down to explore ⬇️")
+
+    # Metrics bar
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Platforms Covered", "5")
-    m2.metric("Ad Creatives",       str(len(data.get("images", []))))
-    m3.metric("Audience Personas",  str(len(data.get("personas", []))))
-    m4.metric("Generated In",       "< 90s")
+    m2.metric("Ad Creatives",      str(len(data.get("images",   []))))
+    m3.metric("Audience Personas", str(len(data.get("personas", []))))
+    m4.metric("Generated In",      "< 90s")
 
     st.divider()
 

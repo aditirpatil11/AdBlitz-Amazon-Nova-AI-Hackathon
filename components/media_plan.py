@@ -27,7 +27,7 @@ def render_media_plan(media_plan):
             hole=0.3
         )
         fig.update_layout(margin=dict(t=40, b=10, l=10, r=10))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig,width='stretch')
 
     # Platform strategy
     with col2:
@@ -58,4 +58,4 @@ def render_media_plan(media_plan):
     df = pd.DataFrame(media_plan["seven_day_calendar"])
     # Rename columns for display
     df.columns = [c.replace("_", " ").title() for c in df.columns]
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, width='stretch', hide_index=True)

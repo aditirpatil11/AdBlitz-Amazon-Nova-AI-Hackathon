@@ -1,5 +1,5 @@
 import json
-
+import base64
 from agents._json_utils import parse_json_response
 from services.bedrock import call_nova_multimodal
 
@@ -38,9 +38,12 @@ def run_brand_agent(image_bytes):
     Takes raw image bytes, sends to Nova Lite for brand analysis.
     Returns a parsed Brand Brief dictionary.
     """
+    # FIXED — convert bytes to base64 first:
+  
+
     raw_text = call_nova_multimodal(
         prompt="Analyze this product photo and create a complete brand brief.",
-        image_base64=image_bytes,
+        image_base64=base64.b64encode(image_bytes).decode("utf-8"),
         system_prompt=BRAND_SYSTEM_PROMPT,
         max_tokens=1024,
         temperature=0.7,

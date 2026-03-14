@@ -10,4 +10,4 @@ def render_image_gallery(images):
             label   = img["format"].replace("_", " ").title()
             caption = f"{label} — {img['platform']} | {img['description']}"
             with st.expander(f"🖼️ {label}", expanded=True):
-                st.image(img["url"], caption=caption, use_container_width=True)
+                st.image(img["url"], caption=caption, use_container_width='stretch')

@@ -33,7 +33,7 @@ def render_upload(on_generate):
             st.image(
                 uploaded_file,
                 caption="Product Preview",
-                use_container_width=True
+                width='stretch',
             )
 
     with col2:
