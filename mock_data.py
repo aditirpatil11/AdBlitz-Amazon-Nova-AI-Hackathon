@@ -96,3 +96,31 @@ MOCK_PERSONAS = [
         "best_ad_format": "TikTok Video + Instagram Carousel"
     }
 ]
+MOCK_MEDIA_PLAN = {
+    "budget_split": {
+        "instagram": 40,
+        "tiktok": 25,
+        "google": 20,
+        "email": 15
+    },
+    "daily_budget_recommendation": "$50-$100/day",
+    "platform_strategy": [
+        {"platform": "Instagram", "creatives": ["carousel", "story", "video"], "targeting": "Emma + Maya"},
+        {"platform": "TikTok", "creatives": ["video"], "targeting": "Maya + younger audience"},
+        {"platform": "Google", "creatives": ["search ads"], "targeting": "Rachel searching for gifts"},
+        {"platform": "Email", "creatives": ["welcome sequence"], "targeting": "Existing customers"}
+    ],
+    "ab_tests": [
+        {"test": "Instagram hook", "variant_a": "Your evening deserves this.", "variant_b": "Stop scrolling. Light this instead.", "metric": "CTR"},
+        {"test": "Google headline", "variant_a": "Pure Calm", "variant_b": "40-Hour Burn", "metric": "Conversions"}
+    ],
+    "seven_day_calendar": [
+        {"day": 1, "action": "Soft launch Instagram carousel", "platform": "Instagram"},
+        {"day": 2, "action": "Launch TikTok video", "platform": "TikTok"},
+        {"day": 3, "action": "Start Google search ads", "platform": "Google"},
+        {"day": 4, "action": "Send email blast", "platform": "Email"},
+        {"day": 5, "action": "Boost best Instagram post", "platform": "Instagram"},
+        {"day": 6, "action": "Launch Facebook retargeting", "platform": "Facebook"},
+        {"day": 7, "action": "Review metrics, scale winners", "platform": "All"}
+    ]
+}
