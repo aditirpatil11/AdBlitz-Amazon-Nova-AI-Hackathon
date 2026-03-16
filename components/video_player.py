@@ -3,7 +3,8 @@ import streamlit as st
 
 def render_video_player(video):
     if not video.get("url"):
-        st.warning("Video generation failed. Try regenerating from the Regenerate page.")
+        message = video.get("error") or "Video generation failed. Try regenerating from the Regenerate page."
+        st.warning(message)
         return
 
     col1, col2 = st.columns([3, 2])

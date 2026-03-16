@@ -2,7 +2,6 @@ import json
 import hashlib
 import concurrent.futures
 import threading
-import boto3
 import requests
 from agents.brand_agent import run_brand_agent
 from agents.copy_agent import run_copy_agent
@@ -12,7 +11,7 @@ from agents.video_agent import run_video_agent
 from agents.audio_agent import run_audio_agent
 from agents.mediaplan_agent import run_mediaplan_agent
 from agents.refine_agent import run_refine_agent
-from services._common import get_setting
+from services._common import build_aws_client, get_setting
 from services.elevenlabs import generate_voiceover, list_voices
 from services.moviepy_processor import add_text_overlay, merge_audio_video
 from services.nova_canvas import generate_image
@@ -22,12 +21,8 @@ from services.nova_reel import generate_video
 # ── S3-based cache ────────────────────────────────────────────
 
 def _get_s3_client():
-    return boto3.client(
-        "s3",
-        region_name=get_setting("AWS_REGION"),
-        aws_access_key_id=get_setting("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=get_setting("AWS_SECRET_ACCESS_KEY"),
-    )
+    # Keep S3 auth behavior consistent with all other AWS service clients.
+    return build_aws_client("s3")
 
 
 def _cache_key(image_bytes):
@@ -56,6 +51,24 @@ def _save_to_cache(image_bytes, campaign):
         )
     except Exception:
         pass
+
+
+def _has_complete_video(campaign):
+    video = (campaign or {}).get("video") or {}
+    return bool(video.get("url"))
+
+
+def _can_resume_video_from_cache(campaign):
+    if not campaign or _has_complete_video(campaign):
+        return False
+
+    required_fields = ("brand_brief", "copy", "personas", "images", "video", "audio")
+    if not all(field in campaign for field in required_fields):
+        return False
+
+    video = campaign.get("video") or {}
+    audio = campaign.get("audio") or {}
+    return bool(video.get("video_prompt") and audio.get("script_text"))
 
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -207,65 +220,76 @@ def _render_video_assets_with_timeout(image_bytes, video_plan, audio_plan, timeo
 
 def generate_campaign(image_bytes, status_callback=None):
     cached = get_cached_campaign(image_bytes)
-    if cached:
+    if _has_complete_video(cached):
         _emit(status_callback, "Loading from cache...")
         return cached
 
-    campaign = {}
+    if _can_resume_video_from_cache(cached):
+        _emit(status_callback, "Retrying video generation from cache...")
+        campaign = cached
+        brand_brief = campaign["brand_brief"]
+        copy_output = campaign["copy"]
+        personas = campaign["personas"]
+        video_plan = campaign["video"]
+        audio_output = campaign["audio"]
+    else:
+        campaign = {}
 
-    _emit(status_callback, "Analyzing product...")
-    brand_brief = run_brand_agent(image_bytes)
-    campaign["brand_brief"] = brand_brief
+        _emit(status_callback, "Analyzing product...")
+        brand_brief = run_brand_agent(image_bytes)
+        campaign["brand_brief"] = brand_brief
 
-    _emit(status_callback, "Writing copy, building personas, planning visuals...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        future_copy = pool.submit(run_copy_agent, brand_brief)
-        future_audience = pool.submit(run_audience_agent, brand_brief)
-        future_visual = pool.submit(run_visual_agent, brand_brief)
+        _emit(status_callback, "Writing copy, building personas, planning visuals...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            future_copy = pool.submit(run_copy_agent, brand_brief)
+            future_audience = pool.submit(run_audience_agent, brand_brief)
+            future_visual = pool.submit(run_visual_agent, brand_brief)
 
-        copy_output = future_copy.result()
-        personas = future_audience.result()
-        image_specs = future_visual.result()
+            copy_output = future_copy.result()
+            personas = future_audience.result()
+            image_specs = future_visual.result()
 
-    campaign["copy"] = copy_output
-    campaign["personas"] = personas
+        campaign["copy"] = copy_output
+        campaign["personas"] = personas
 
-    _emit(status_callback, "Generating ad images...")
-    campaign["images"] = _render_images(image_specs)
+        _emit(status_callback, "Generating ad images...")
+        campaign["images"] = _render_images(image_specs)
+
+        _emit(status_callback, "Directing video ad...")
+        video_plan = run_video_agent(brand_brief, copy_output.get("tiktok", {}))
+
+        _emit(status_callback, "Selecting voice...")
+        try:
+            _, summarized = _summarize_voices()
+        except Exception:
+            summarized = []
+        audio_output = run_audio_agent(brand_brief, video_plan.get("voiceover_script", ""), summarized)
+
+        # Save campaign WITHOUT video first so user gets results faster
+        campaign["video"] = dict(video_plan)
+        campaign["video"]["url"] = None
+        campaign["video"]["has_voiceover"] = False
+        campaign["video"]["status"] = "generating"
+        campaign["audio"] = dict(audio_output)
+        campaign["audio"]["url"] = None
+
+        # Save partial campaign to cache (everything except video)
+        _save_to_cache(image_bytes, campaign)
 
     lifestyle_bytes = _get_lifestyle_image_bytes(campaign["images"])
     video_source = lifestyle_bytes if lifestyle_bytes else image_bytes
 
-    _emit(status_callback, "Directing video ad...")
-    video_plan = run_video_agent(brand_brief, copy_output.get("tiktok", {}))
-
-    _emit(status_callback, "Selecting voice...")
-    try:
-        _, summarized = _summarize_voices()
-    except Exception:
-        summarized = []
-    audio_output = run_audio_agent(brand_brief, video_plan.get("voiceover_script", ""), summarized)
-
     _emit(status_callback, "Generating video and voiceover (this may take a few minutes)...")
-
-    # Save campaign WITHOUT video first so user gets results faster
-    campaign["video"] = dict(video_plan)
-    campaign["video"]["url"] = None
-    campaign["video"]["has_voiceover"] = False
-    campaign["video"]["status"] = "generating"
-    campaign["audio"] = dict(audio_output)
-    campaign["audio"]["url"] = None
-    campaign["media_plan"] = run_mediaplan_agent(brand_brief, copy_output, personas)
-
-    # Save partial campaign to cache (everything except video)
-    _save_to_cache(image_bytes, campaign)
 
     # Now attempt video generation with timeout (10 min)
     video_result = _render_video_assets_with_timeout(video_source, video_plan, audio_output, timeout=600)
 
     if video_result["video"] and not video_result["error"]:
         campaign["video"] = video_result["video"]
+        campaign["video"]["status"] = "completed"
+        campaign["video"].pop("error", None)
         campaign["audio"] = video_result["audio"]
+        campaign["audio"].pop("error", None)
     else:
         campaign["video"] = dict(video_plan)
         campaign["video"]["url"] = None
@@ -275,8 +299,9 @@ def generate_campaign(image_bytes, status_callback=None):
         campaign["audio"] = dict(audio_output)
         campaign["audio"]["url"] = None
 
-    _emit(status_callback, "Creating launch strategy...")
-    campaign["media_plan"] = run_mediaplan_agent(brand_brief, copy_output, personas)
+    if not campaign.get("media_plan"):
+        _emit(status_callback, "Creating launch strategy...")
+        campaign["media_plan"] = run_mediaplan_agent(brand_brief, copy_output, personas)
 
     _emit(status_callback, "Done.")
     # Save final campaign with video (or without if failed)
