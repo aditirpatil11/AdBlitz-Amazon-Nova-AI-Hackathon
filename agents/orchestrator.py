@@ -1,13 +1,16 @@
 import json
-
-from agents.audio_agent import run_audio_agent
-from agents.audience_agent import run_audience_agent
+import hashlib
+import concurrent.futures
+import boto3
+import requests
 from agents.brand_agent import run_brand_agent
 from agents.copy_agent import run_copy_agent
+from agents.audience_agent import run_audience_agent
+from agents.visual_agent import run_visual_agent
+from agents.video_agent import run_video_agent
+from agents.audio_agent import run_audio_agent
 from agents.mediaplan_agent import run_mediaplan_agent
 from agents.refine_agent import run_refine_agent
-from agents.video_agent import run_video_agent
-from agents.visual_agent import run_visual_agent
 from services._common import get_setting
 from services.elevenlabs import generate_voiceover, list_voices
 from services.moviepy_processor import add_text_overlay, merge_audio_video
@@ -15,223 +18,298 @@ from services.nova_canvas import generate_image
 from services.nova_reel import generate_video
 
 
-def _emit(status_callback, message):
-    if status_callback:
-        status_callback(message)
+# ── S3-based cache ────────────────────────────────────────────
+
+def _get_s3_client():
+    return boto3.client(
+        "s3",
+        region_name=get_setting("AWS_REGION"),
+        aws_access_key_id=get_setting("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=get_setting("AWS_SECRET_ACCESS_KEY"),
+    )
 
 
-def _image_dimensions(image_format):
-    if image_format == "story":
+def _cache_key(image_bytes):
+    return hashlib.md5(image_bytes).hexdigest()
+
+
+def get_cached_campaign(image_bytes):
+    key = _cache_key(image_bytes)
+    try:
+        s3 = _get_s3_client()
+        obj = s3.get_object(Bucket=get_setting("S3_BUCKET"), Key=f"cache/{key}.json")
+        return json.loads(obj["Body"].read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _save_to_cache(image_bytes, campaign):
+    key = _cache_key(image_bytes)
+    try:
+        s3 = _get_s3_client()
+        s3.put_object(
+            Bucket=get_setting("S3_BUCKET"),
+            Key=f"cache/{key}.json",
+            Body=json.dumps(campaign),
+            ContentType="application/json",
+        )
+    except Exception:
+        pass
+
+
+# ── Helpers ───────────────────────────────────────────────────
+
+def _emit(cb, msg):
+    if cb:
+        cb(msg)
+
+
+def _image_dimensions(fmt):
+    if fmt == "story":
         return 720, 1280
     return 1024, 1024
 
 
 def _summarize_voices():
     voices = list_voices()
-    summarized = []
-    for voice in voices:
-        summarized.append(
-            {
-                "voice_id": voice.get("voice_id"),
-                "name": voice.get("name"),
-                "labels": voice.get("labels", {}),
-                "description": voice.get("description", ""),
-            }
-        )
+    summarized = [
+        {
+            "voice_id": v.get("voice_id"),
+            "name": v.get("name"),
+            "labels": v.get("labels", {}),
+            "description": v.get("description", ""),
+        }
+        for v in voices
+    ]
     return voices, summarized
 
 
 def _pick_voice_id(audio_output, voices):
-    configured_voice_id = get_setting("ELEVENLABS_VOICE_ID", default="")
+    configured = get_setting("ELEVENLABS_VOICE_ID", default="")
     if audio_output.get("voice_id"):
         return audio_output["voice_id"]
-    if configured_voice_id:
-        return configured_voice_id
+    if configured:
+        return configured
     if voices:
         return voices[0].get("voice_id")
     raise RuntimeError("No ElevenLabs voice_id available.")
 
 
-def _render_images(image_specs):
-    rendered = []
-    for image_spec in image_specs:
-        width, height = _image_dimensions(image_spec.get("format"))
-        asset = {
-            "format": image_spec.get("format"),
-            "platform": image_spec.get("platform"),
-            "description": image_spec.get("description"),
-            "prompt": image_spec.get("prompt"),
-            "url": None,
-        }
-        try:
-            asset["url"] = generate_image(
-                image_spec["prompt"],
-                width=width,
-                height=height,
-            )
-        except Exception as exc:
-            asset["error"] = str(exc)
-        rendered.append(asset)
-    return rendered
+def _render_one_image(spec):
+    w, h = _image_dimensions(spec.get("format"))
+    asset = {
+        "format": spec.get("format"),
+        "platform": spec.get("platform"),
+        "description": spec.get("description"),
+        "prompt": spec.get("prompt"),
+        "url": None,
+    }
+    try:
+        asset["url"] = generate_image(spec["prompt"], width=w, height=h)
+    except Exception as e:
+        asset["error"] = str(e)
+    return asset
+
+
+def _render_images(specs):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        return list(pool.map(_render_one_image, specs))
+
+
+def _get_lifestyle_image_bytes(images):
+    for img in images:
+        if img.get("format") == "lifestyle" and img.get("url"):
+            try:
+                r = requests.get(img["url"], timeout=15)
+                if r.status_code == 200:
+                    return r.content
+            except Exception:
+                pass
+    for img in images:
+        if img.get("url"):
+            try:
+                r = requests.get(img["url"], timeout=15)
+                if r.status_code == 200:
+                    return r.content
+            except Exception:
+                pass
+    return None
 
 
 def _render_video_assets(image_bytes, video_plan, audio_plan):
-    rendered_video = dict(video_plan)
-    rendered_audio = dict(audio_plan)
+    rv = dict(video_plan)
+    ra = dict(audio_plan)
 
     try:
         voices, _ = _summarize_voices()
     except Exception:
         voices = []
-    voice_id = _pick_voice_id(rendered_audio, voices)
-    rendered_audio["voice_id"] = voice_id
-    rendered_audio["url"] = generate_voiceover(rendered_audio["script_text"], voice_id)
 
-    raw_video_url = generate_video(
-        image_bytes,
-        rendered_video["video_prompt"],
-        duration_seconds=rendered_video.get("duration_seconds", 6),
+    voice_id = _pick_voice_id(ra, voices)
+    ra["voice_id"] = voice_id
+    ra["url"] = generate_voiceover(ra["script_text"], voice_id)
+
+    raw_url = generate_video(
+        image_bytes, rv["video_prompt"],
+        duration_seconds=rv.get("duration_seconds", 6),
     )
-    rendered_video["raw_url"] = raw_video_url
+    rv["raw_url"] = raw_url
 
-    text_overlays = rendered_video.get("text_overlays") or []
-    text_overlay_url = add_text_overlay(raw_video_url, text_overlays) if text_overlays else raw_video_url
-    rendered_video["text_overlay_url"] = text_overlay_url
+    overlay_url = raw_url
+    rv["text_overlay_url"] = raw_url
 
-    final_video_url = merge_audio_video(text_overlay_url, rendered_audio["url"])
-    rendered_video["url"] = final_video_url
-    rendered_video["has_voiceover"] = True
+    final_url = merge_audio_video(overlay_url, ra["url"])
+    rv["url"] = final_url
+    rv["has_voiceover"] = True
 
-    return rendered_video, rendered_audio
+    return rv, ra
 
+
+# ── Main pipeline ─────────────────────────────────────────────
 
 def generate_campaign(image_bytes, status_callback=None):
-    """
-    Main pipeline: takes a product photo and runs all 7 agents plus real media services.
-    """
+    cached = get_cached_campaign(image_bytes)
+    if cached:
+        _emit(status_callback, "Loading from cache...")
+        return cached
+
     campaign = {}
 
-    _emit(status_callback, "Brand Agent analyzing product...")
+    _emit(status_callback, "Analyzing product...")
     brand_brief = run_brand_agent(image_bytes)
     campaign["brand_brief"] = brand_brief
 
-    _emit(status_callback, "Copy Agent writing ad copy...")
-    copy_output = run_copy_agent(brand_brief)
-    campaign["copy"] = copy_output
+    _emit(status_callback, "Writing copy, building personas, planning visuals...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        future_copy = pool.submit(run_copy_agent, brand_brief)
+        future_audience = pool.submit(run_audience_agent, brand_brief)
+        future_visual = pool.submit(run_visual_agent, brand_brief)
 
-    _emit(status_callback, "Audience Agent creating personas...")
-    personas = run_audience_agent(brand_brief)
+        copy_output = future_copy.result()
+        personas = future_audience.result()
+        image_specs = future_visual.result()
+
+    campaign["copy"] = copy_output
     campaign["personas"] = personas
 
-    _emit(status_callback, "Visual Agent planning campaign images...")
-    image_specs = run_visual_agent(brand_brief)
-    _emit(status_callback, "Visual Agent generating final images...")
+    _emit(status_callback, "Generating ad images...")
     campaign["images"] = _render_images(image_specs)
 
-    _emit(status_callback, "Video Agent creating video prompt...")
+    lifestyle_bytes = _get_lifestyle_image_bytes(campaign["images"])
+    video_source = lifestyle_bytes if lifestyle_bytes else image_bytes
+
+    _emit(status_callback, "Directing video ad...")
     video_plan = run_video_agent(brand_brief, copy_output.get("tiktok", {}))
 
-    _emit(status_callback, "Audio Agent selecting voice...")
+    _emit(status_callback, "Selecting voice...")
     try:
-        _, summarized_voices = _summarize_voices()
+        _, summarized = _summarize_voices()
     except Exception:
-        summarized_voices = []
-    audio_output = run_audio_agent(brand_brief, video_plan.get("voiceover_script", ""), summarized_voices)
+        summarized = []
+    audio_output = run_audio_agent(brand_brief, video_plan.get("voiceover_script", ""), summarized)
 
-    _emit(status_callback, "Generating voiceover and video assets...")
+    _emit(status_callback, "Generating video and voiceover...")
     try:
-        video_output, audio_output = _render_video_assets(image_bytes, video_plan, audio_output)
-    except Exception as exc:
+        video_output, audio_output = _render_video_assets(video_source, video_plan, audio_output)
+    except Exception as e:
         video_output = dict(video_plan)
         video_output["url"] = None
         video_output["has_voiceover"] = False
-        video_output["error"] = str(exc)
+        video_output["error"] = str(e)
         audio_output = dict(audio_output)
         audio_output["url"] = None
-        audio_output["error"] = str(exc)
+        audio_output["error"] = str(e)
 
     campaign["video"] = video_output
     campaign["audio"] = audio_output
 
-    _emit(status_callback, "Media Plan Agent creating launch strategy...")
+    _emit(status_callback, "Creating launch strategy...")
     campaign["media_plan"] = run_mediaplan_agent(brand_brief, copy_output, personas)
 
-    _emit(status_callback, "Campaign complete!")
+    _emit(status_callback, "Done.")
+    _save_to_cache(image_bytes, campaign)
+
     return campaign
 
 
+# ── Refine ────────────────────────────────────────────────────
+
 def refine_campaign(feedback, current_campaign, image_bytes=None, status_callback=None):
-    """
-    Re-runs only the affected agents and regenerates assets when needed.
-    """
-    _emit(status_callback, "Analyzing your feedback...")
+    _emit(status_callback, "Analyzing feedback...")
     refine_result = run_refine_agent(feedback, current_campaign)
     agents_to_rerun = set(refine_result.get("agents_to_rerun", []))
 
     brand_brief = current_campaign["brand_brief"]
     copy_output = current_campaign["copy"]
     personas = current_campaign["personas"]
-    image_specs = current_campaign.get("images", [])
-    video_output = current_campaign.get("video", {})
-    audio_output = current_campaign.get("audio", {})
 
     if "brand_agent" in agents_to_rerun and image_bytes:
         _emit(status_callback, "Re-running Brand Agent...")
         brand_brief = run_brand_agent(image_bytes)
         current_campaign["brand_brief"] = brand_brief
 
-    if "copy_agent" in agents_to_rerun:
-        _emit(status_callback, "Re-running Copy Agent...")
-        copy_output = run_copy_agent(brand_brief)
-        current_campaign["copy"] = copy_output
+    parallel_agents = {"copy_agent", "audience_agent", "visual_agent"} & agents_to_rerun
+    if parallel_agents:
+        _emit(status_callback, "Regenerating affected sections...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            futures = {}
+            if "copy_agent" in parallel_agents:
+                futures["copy"] = pool.submit(run_copy_agent, brand_brief)
+            if "audience_agent" in parallel_agents:
+                futures["personas"] = pool.submit(run_audience_agent, brand_brief)
+            if "visual_agent" in parallel_agents:
+                futures["images"] = pool.submit(run_visual_agent, brand_brief)
 
-    if "audience_agent" in agents_to_rerun:
-        _emit(status_callback, "Re-running Audience Agent...")
-        personas = run_audience_agent(brand_brief)
-        current_campaign["personas"] = personas
-
-    if "visual_agent" in agents_to_rerun:
-        _emit(status_callback, "Re-running Visual Agent...")
-        image_specs = run_visual_agent(brand_brief)
-        current_campaign["images"] = _render_images(image_specs)
+            if "copy" in futures:
+                copy_output = futures["copy"].result()
+                current_campaign["copy"] = copy_output
+            if "personas" in futures:
+                personas = futures["personas"].result()
+                current_campaign["personas"] = personas
+            if "images" in futures:
+                specs = futures["images"].result()
+                current_campaign["images"] = _render_images(specs)
 
     if "video_agent" in agents_to_rerun:
         _emit(status_callback, "Re-running Video Agent...")
         video_output = run_video_agent(brand_brief, copy_output.get("tiktok", {}))
+        current_campaign["video"] = video_output
 
     if "audio_agent" in agents_to_rerun:
         _emit(status_callback, "Re-running Audio Agent...")
         try:
-            _, summarized_voices = _summarize_voices()
+            _, summarized = _summarize_voices()
         except Exception:
-            summarized_voices = []
+            summarized = []
         audio_output = run_audio_agent(
             brand_brief,
-            video_output.get("voiceover_script", ""),
-            summarized_voices,
+            current_campaign.get("video", {}).get("voiceover_script", ""),
+            summarized,
         )
+        current_campaign["audio"] = audio_output
 
     if {"video_agent", "audio_agent"} & agents_to_rerun:
-        _emit(status_callback, "Regenerating video and audio assets...")
+        _emit(status_callback, "Regenerating video assets...")
         if image_bytes:
             try:
-                video_output, audio_output = _render_video_assets(image_bytes, video_output, audio_output)
-            except Exception as exc:
-                video_output = dict(video_output)
-                video_output["url"] = None
-                video_output["has_voiceover"] = False
-                video_output["error"] = str(exc)
-                audio_output = dict(audio_output)
-                audio_output["url"] = None
-                audio_output["error"] = str(exc)
-        current_campaign["video"] = video_output
-        current_campaign["audio"] = audio_output
+                lifestyle_bytes = _get_lifestyle_image_bytes(current_campaign.get("images", []))
+                video_source = lifestyle_bytes if lifestyle_bytes else image_bytes
+                v, a = _render_video_assets(
+                    video_source,
+                    current_campaign.get("video", {}),
+                    current_campaign.get("audio", {}),
+                )
+                current_campaign["video"] = v
+                current_campaign["audio"] = a
+            except Exception as e:
+                current_campaign["video"]["error"] = str(e)
+                current_campaign["audio"]["error"] = str(e)
 
     if "mediaplan_agent" in agents_to_rerun:
         _emit(status_callback, "Re-running Media Plan Agent...")
         current_campaign["media_plan"] = run_mediaplan_agent(brand_brief, copy_output, personas)
 
-    _emit(status_callback, "Refinement complete!")
+    _emit(status_callback, "Refinement complete.")
     return current_campaign
 
 
@@ -240,17 +318,15 @@ if __name__ == "__main__":
 
     if len(sys.argv) < 2:
         print("Usage: python -m agents.orchestrator <image_path>")
-        print("Example: python -m agents.orchestrator test_candle.jpg")
         sys.exit(1)
 
-    image_path = sys.argv[1]
-    with open(image_path, "rb") as file_handle:
-        img_bytes = file_handle.read()
+    with open(sys.argv[1], "rb") as f:
+        img = f.read()
 
-    def print_status(message):
-        print(f"  >> {message}")
+    def log(msg):
+        print(f"  >> {msg}")
 
     print("Running full campaign pipeline...")
-    result = generate_campaign(img_bytes, status_callback=print_status)
+    result = generate_campaign(img, status_callback=log)
     print("\n=== FULL CAMPAIGN OUTPUT ===")
     print(json.dumps(result, indent=2))

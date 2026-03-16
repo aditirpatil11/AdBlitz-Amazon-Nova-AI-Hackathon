@@ -47,9 +47,18 @@ def _invocation_output_key(base_prefix: str, invocation_id: str) -> str:
 def _normalize_image_for_reel(image_input: Any):
     raw_image = decode_base64_bytes(image_input)
     with Image.open(io.BytesIO(raw_image)) as image:
-        normalized = ImageOps.fit(image.convert("RGB"), (1280, 720), method=Image.Resampling.LANCZOS)
+        img = image.convert("RGB")
+        # Sample background color from image edge for natural blending
+        edge_color = img.getpixel((0, 0))
+        bg = Image.new("RGB", (1280, 720), edge_color)
+        # Scale image to fit within 1280x720 without cropping
+        img.thumbnail((1280, 720), Image.Resampling.LANCZOS)
+        # Center it on the background
+        x = (1280 - img.width) // 2
+        y = (720 - img.height) // 2
+        bg.paste(img, (x, y))
         buffer = io.BytesIO()
-        normalized.save(buffer, format="PNG")
+        bg.save(buffer, format="PNG")
     normalized_bytes = buffer.getvalue()
     return normalized_bytes, base64.b64encode(normalized_bytes).decode("utf-8")
 
